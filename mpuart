@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""Share one serial port between several terminals, scripts and a log file.
+
+    mpuart serve /dev/ttyUSB0 115200      # owns the port, serves everyone else
+    mpuart attach                         # interactive, like pyserial-miniterm --raw
+    mpuart attach -r ttyUSB0              # watch only, cannot type
+    mpuart send 'version' -w 2            # one shot for scripts
+    mpuart list
+
+Leave the port out and the only one being served is used. Name it when there
+are several.
+
+Everything typed by one client is shown to the others as `[name] text`, and
+lands in the log with the name beside it.
+"""
+
+import argparse
+import errno
+import fcntl
+import getpass
+import json
+import os
+import re
+import selectors
+import shlex
+import signal
+import socket
+import stat
+import sys
+import time
+
+RUNDIR = os.environ.get("MPUART_DIR", "/tmp/mpuart")
+HELLO = b"\x01mpuart1 "          # optional first line; raw clients may skip it
+QUIT = b"\x1d"                   # Ctrl-] , same as miniterm
+HIST_CAP = 4 << 20               # a device that sends no newlines must not eat memory
+OUTBUF_MAX = 1 << 20
+IDLE_TAG = 0.75                  # tag a half typed line after this long
+IDLE_LOG = 1.0
+REOPEN = 1.0
+
+EOL = {"crlf": b"\r\n", "cr": b"\r", "lf": b"\n"}
+
+C_TAG = "\x1b[33m"
+C_NOTE = "\x1b[36m"
+C_OFF = "\x1b[0m"
+
+
+def ts():
+    t = time.time()
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + ".%03d" % (t % 1 * 1000)
+
+
+def esc(data):
+    """Bytes as something safe to print on one line."""
+    out = []
+    for c in data:
+        if 32 <= c < 127:
+            out.append(chr(c))
+        elif c == 9:
+            out.append("\\t")
+        elif c < 32:
+            out.append("^" + chr(c + 64))
+        elif c == 127:
+            out.append("^?")
+        else:
+            out.append("\\x%02x" % c)
+    return "".join(out)
+
+
+def stable_path(dev):
+    """The by-id name survives a replug, /dev/ttyUSB0 does not."""
+    d = "/dev/serial/by-id"
+    real = os.path.realpath(dev)
+    if os.path.isdir(d):
+        for n in sorted(os.listdir(d)):
+            p = os.path.join(d, n)
+            if os.path.realpath(p) == real:
+                return p
+    return dev
+
+
+def describe(dev):
+    """What the hardware calls itself, if the system knows."""
+    real = os.path.realpath(dev)
+    try:
+        for _, node, what in system_ports():
+            if os.path.realpath(node) == real:
+                a, _, b = what.partition(" - ")
+                return a if a == b else what
+    except Exception:
+        return ""
+    return ""
+
+
+def system_ports():
+    """Serial ports with hardware behind them.
+
+    Every PC reports 32 ttyS lines whether or not anything is wired to them,
+    and they have no hwid. Leaving them in would drown the real ports.
+    """
+    from serial.tools import list_ports
+    return [(stable_path(p.device), p.device, p.description)
+            for p in sorted(list_ports.comports())
+            if p.hwid and p.hwid != "n/a"]
+
+
+def port_menu(ports):
+    out = ["mpuart: %d serial ports, name one:" % len(ports)]
+    for path, dev, what in ports:
+        out.append("")
+        out.append("  %-12s %s" % (os.path.basename(dev), what))
+        out.append("      mpuart serve %s" % path)
+    return "\n".join(out)
+
+
+def parse_history(v):
+    """A plain count is lines, a k or M suffix is bytes."""
+    m = re.fullmatch(r"(\d+)([kKmM]?)", v)
+    if not m:
+        raise argparse.ArgumentTypeError("give a line count, or bytes with k or M")
+    n = int(m.group(1))
+    if m.group(2):
+        return ("bytes", n * (1024 if m.group(2) in "kK" else 1024 * 1024))
+    return ("lines", n)
+
+
+def want_lines(v):
+    """How much backscroll a client asks for: all, none, or a line count."""
+    if v == "all" or (v.isdigit() and int(v) >= 0):
+        return v
+    raise argparse.ArgumentTypeError("give a line count, or all")
+
+
+def last_lines(data, n):
+    if n <= 0:
+        return b""
+    parts = data.split(b"\n")
+    whole, tail = parts[:-1], parts[-1]
+    return b"".join(l + b"\n" for l in whole[-n:]) + tail
+
+
+def sock_path(name):
+    """Socket for a port. A device path names the port, it never is the socket."""
+    if name.endswith(".sock") or (os.path.exists(name) and stat.S_ISSOCK(os.stat(name).st_mode)):
+        return name
+    return os.path.join(RUNDIR, os.path.basename(name) + ".sock")
+
+
+def rundir():
+    os.makedirs(RUNDIR, exist_ok=True)
+    try:
+        os.chmod(RUNDIR, 0o1777)
+    except OSError:
+        pass
+    return RUNDIR
+
+
+# --------------------------------------------------------------------------- server
+
+
+class Client:
+    def __init__(self, sock, who):
+        self.sock = sock
+        self.who = who                # transport, used until a hello names them
+        self.name = who
+        self.ro = False
+        self.color = False
+        self.hist = None              # None all, 0 none, or a line count
+        self.echo = False             # see tags for your own typing
+        self.notes = True
+        self.greeted = False
+        self.query = False
+        self.inbuf = bytearray()      # waiting for the hello line
+        self.out = bytearray()
+        self.pending = bytearray()    # typed, not tagged yet
+        self.last_in = 0.0
+        self.dead = False
+
+
+class Server:
+    def __init__(self, args):
+        self.args = args
+        self.sel = selectors.DefaultSelector()
+        self.clients = {}
+        self.hist = bytearray()
+        self.what = ""
+        self.partial = False          # set when a trim cuts through a line
+        self.fd = -1
+        self.ser = None
+        self.tx = bytearray()
+        self.next_open = 0.0
+        self.logf = None
+        self.rawf = None
+        self.logbuf = bytearray()
+        self.logts = 0.0
+        self.rehup = False
+
+    # -- logging
+
+    def open_logs(self):
+        """Open, or reopen after SIGHUP, which is what logrotate sends."""
+        for f in (self.logf, self.rawf):
+            if f:
+                f.close()
+        self.logf = self.rawf = None
+        if self.args.log:
+            self.logf = open(self.args.log, "a")
+            os.chmod(self.args.log, self.args.mode)
+        if self.args.raw_log:
+            self.rawf = open(self.args.raw_log, "ab", buffering=0)
+
+    def log(self, mark, text):
+        if not self.logf:
+            return
+        self.logf.write("%s %s %s\n" % (ts(), mark, text))
+        self.logf.flush()
+
+    def log_dev(self, data):
+        if self.rawf:
+            self.rawf.write(data)
+            self.rawf.flush()
+        if not self.logf:
+            return
+        self.logbuf += data
+        while True:
+            i = self.logbuf.find(b"\n")
+            if i < 0:
+                break
+            line, self.logbuf = self.logbuf[:i], self.logbuf[i + 1:]
+            self.log("<", esc(bytes(line).rstrip(b"\r")))
+        self.logts = time.time()
+        if len(self.logbuf) > 4096:
+            self.log("<", esc(bytes(self.logbuf)))
+            self.logbuf.clear()
+
+    def log_idle(self):
+        if self.logbuf and time.time() - self.logts > IDLE_LOG:
+            self.log("<", esc(bytes(self.logbuf)))
+            self.logbuf.clear()
+
+    # -- client io
+
+    def send(self, c, data):
+        if c.dead:
+            return
+        c.out += data
+        if len(c.out) > OUTBUF_MAX:
+            self.drop(c, "too slow")
+            return
+        self.flush(c)
+
+    def flush(self, c):
+        while c.out:
+            try:
+                n = c.sock.send(c.out)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.drop(c, "gone")
+                return
+            if n == 0:
+                break
+            del c.out[:n]
+        want = selectors.EVENT_READ | (selectors.EVENT_WRITE if c.out else 0)
+        try:
+            self.sel.modify(c.sock, want, c)
+        except (KeyError, ValueError):
+            pass
+
+    def drop(self, c, why):
+        if c.dead:
+            return
+        c.dead = True
+        try:
+            self.sel.unregister(c.sock)
+        except (KeyError, ValueError):
+            pass
+        c.sock.close()
+        self.clients.pop(id(c), None)
+        if c.greeted:                 # a probe that never said hello is not news
+            self.log("*", "%s detached (%s)" % (c.name, why))
+            self.notice("%s detached" % c.name, None)
+
+    def bcast(self, data, skip=None):
+        for c in list(self.clients.values()):
+            if c is not skip:
+                self.send(c, data)
+
+    def notice(self, text, skip):
+        for c in list(self.clients.values()):
+            if c is skip or not c.notes:
+                continue
+            body = "-- %s --" % text
+            if c.color:
+                body = C_NOTE + body + C_OFF
+            self.send(c, ("\r\n%s\r\n" % body).encode())
+
+    def tag(self, c, text):
+        self.log(">", "%s: %s" % (c.name, text))
+        for o in list(self.clients.values()):
+            if o is c and not c.echo:
+                continue
+            body = "[%s] %s" % (c.name, text)
+            if o.color:
+                body = C_TAG + body + C_OFF
+            self.send(o, ("\r\n%s\r\n" % body).encode())
+
+    # -- typed input
+
+    def typed(self, c, data):
+        if c.ro:
+            self.send(c, b"\r\n-- read only --\r\n")
+            return
+        if self.fd < 0:
+            self.send(c, b"\r\n-- device not open, dropped --\r\n")
+            return
+        self.tx += data
+        self.pump_tx()
+        c.pending += data
+        c.last_in = time.time()
+        while True:
+            m = re.search(rb"\r\n|\r|\n", c.pending)
+            if not m:
+                break
+            line = c.pending[:m.start()]
+            del c.pending[:m.end()]
+            self.tag(c, esc(bytes(line)) if line else "<enter>")
+
+    def tag_idle(self):
+        now = time.time()
+        for c in list(self.clients.values()):
+            if c.pending and now - c.last_in > IDLE_TAG:
+                self.tag(c, esc(bytes(c.pending)))
+                c.pending.clear()
+
+    # -- hello
+
+    def hello(self, c, line):
+        opts = {}
+        for tok in shlex.split(line.decode("utf-8", "replace")):
+            k, _, v = tok.partition("=")
+            opts[k] = v
+        c.name = opts.get("name") or c.who
+        c.ro = opts.get("ro") == "1"
+        c.color = opts.get("color") == "1"
+        c.echo = opts.get("echo") == "1"
+        c.notes = opts.get("notes", "1") == "1"
+        try:                          # hist is all, 0, or a line count
+            h = opts.get("hist", "all")
+            c.hist = None if h == "all" else max(0, int(h))
+        except ValueError:
+            c.hist = None
+        c.query = opts.get("query") == "1"
+
+    def status(self):
+        return {
+            "name": self.args.port_name,
+            "device": self.args.device,
+            "baud": self.args.baud,
+            "what": self.what,
+            "open": self.fd >= 0,
+            "clients": sorted(o.name for o in self.clients.values() if o.greeted),
+            "log": self.args.log or "",
+            "pid": os.getpid(),
+        }
+
+    def answer(self, c):
+        """One line of JSON for mpuart list, then gone. Not an attach."""
+        try:
+            c.sock.settimeout(1.0)
+            c.sock.sendall((json.dumps(self.status()) + "\n").encode())
+        except OSError:
+            pass
+        self.drop(c, "query")
+
+    def greet(self, c):
+        c.greeted = True
+        self.log("*", "%s attached%s" % (c.name, " (read only)" if c.ro else ""))
+        self.notice("%s attached%s" % (c.name, " (read only)" if c.ro else ""), c)
+        if c.hist != 0:
+            self.send(c, self.backscroll(c.hist))
+        if c.notes:
+            state = "connected" if self.fd >= 0 else "waiting for device"
+            others = [o.name for o in self.clients.values() if o is not c]
+            self.notice_one(c, "%s %d baud, %s%s" % (
+                self.args.device, self.args.baud, state,
+                ("; here: " + ", ".join(others)) if others else ""))
+
+    def notice_one(self, c, text):
+        body = "-- %s --" % text
+        if c.color:
+            body = C_NOTE + body + C_OFF
+        self.send(c, ("\r\n%s\r\n" % body).encode())
+
+    # -- serial
+
+    def open_dev(self):
+        import serial
+        self.next_open = time.time() + REOPEN
+        try:
+            self.ser = serial.Serial(
+                self.args.device, self.args.baud,
+                bytesize=8, parity="N", stopbits=1,
+                rtscts=self.args.rtscts, xonxoff=self.args.xonxoff,
+                exclusive=not self.args.no_exclusive, timeout=0)
+        except Exception as e:
+            if self.args.verbose:
+                print("open %s: %s" % (self.args.device, e), file=sys.stderr)
+            self.ser = None
+            return
+        self.fd = self.ser.fileno()
+        fl = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        self.sel.register(self.fd, selectors.EVENT_READ, "dev")
+        self.log("*", "device open")
+        self.notice("%s open" % self.args.device, None)
+
+    def close_dev(self, why):
+        if self.fd < 0:
+            return
+        try:
+            self.sel.unregister(self.fd)
+        except (KeyError, ValueError):
+            pass
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        self.fd = -1
+        self.ser = None
+        self.tx.clear()
+        self.next_open = time.time() + REOPEN
+        self.log("*", "device lost (%s)" % why)
+        self.notice("%s lost (%s), retrying" % (self.args.device, why), None)
+
+    def pump_tx(self):
+        if self.fd < 0:
+            return
+        while self.tx:
+            try:
+                n = os.write(self.fd, self.tx)
+            except BlockingIOError:
+                break
+            except OSError as e:
+                self.close_dev(e.strerror or "write error")
+                return
+            del self.tx[:n]
+        want = selectors.EVENT_READ | (selectors.EVENT_WRITE if self.tx else 0)
+        self.sel.modify(self.fd, want, "dev")
+
+    def trim_hist(self):
+        """Keep the ring inside its limit and starting on a whole line."""
+        kind, n = self.args.history
+        if kind == "bytes":
+            if len(self.hist) > n:
+                del self.hist[:-n]
+                self.partial = True
+        else:
+            extra = self.hist.count(b"\n") - n
+            if extra > 0:
+                cut = -1
+                for _ in range(extra):
+                    cut = self.hist.find(b"\n", cut + 1)
+                del self.hist[:cut + 1]
+            if len(self.hist) > HIST_CAP:
+                del self.hist[:-HIST_CAP]
+                self.partial = True
+        if self.partial:
+            i = self.hist.find(b"\n")
+            if i >= 0:
+                del self.hist[:i + 1]
+                self.partial = False
+
+    def backscroll(self, want):
+        out = bytes(self.hist)
+        return out if want is None else last_lines(out, want)
+
+    def dev_read(self):
+        try:
+            data = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError as e:
+            self.close_dev(e.strerror or "read error")
+            return
+        if not data:
+            self.close_dev("eof")
+            return
+        self.hist += data
+        self.trim_hist()
+        self.log_dev(data)
+        self.bcast(data)
+
+    # -- listeners
+
+    def listen_unix(self):
+        rundir()
+        path = os.path.join(RUNDIR, self.args.port_name + ".sock")
+        if os.path.exists(path):
+            if not stat.S_ISSOCK(os.stat(path).st_mode):
+                sys.exit("mpuart: %s is not a socket, refusing to replace it" % path)
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(path)
+                probe.close()
+                sys.exit("mpuart: %s already served on %s" % (self.args.device, path))
+            except OSError:
+                os.unlink(path)
+            finally:
+                probe.close()
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        os.chmod(path, self.args.mode)
+        s.listen(16)
+        s.setblocking(False)
+        self.sel.register(s, selectors.EVENT_READ, "unix")
+        self.path = path
+        return path
+
+    def listen_tcp(self):
+        host, _, port = self.args.tcp.rpartition(":")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host or "127.0.0.1", int(port)))
+        s.listen(16)
+        s.setblocking(False)
+        self.sel.register(s, selectors.EVENT_READ, "tcp")
+        return "%s:%s" % (host or "127.0.0.1", port)
+
+    def accept(self, ls, kind):
+        try:
+            sock, addr = ls.accept()
+        except OSError:
+            return
+        sock.setblocking(False)
+        who = "%s:%s" % addr if kind == "tcp" else "unix"
+        c = Client(sock, who)
+        self.clients[id(c)] = c
+        self.sel.register(sock, selectors.EVENT_READ, c)
+
+    def client_read(self, c):
+        try:
+            data = c.sock.recv(4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            self.drop(c, "reset")
+            return
+        if not data:
+            self.drop(c, "eof")
+            return
+        if not c.greeted:
+            c.inbuf += data
+            if c.inbuf.startswith(HELLO[:1]):
+                i = c.inbuf.find(b"\n")
+                if i < 0:
+                    if len(c.inbuf) > 1024:
+                        self.drop(c, "bad hello")
+                    return
+                line, rest = c.inbuf[:i], c.inbuf[i + 1:]
+                self.hello(c, bytes(line[len(HELLO):]))
+                data = bytes(rest)
+            else:
+                data = bytes(c.inbuf)
+            c.inbuf.clear()
+            if c.query:
+                self.answer(c)
+                return
+            self.greet(c)
+        if data:
+            self.typed(c, data)
+
+    # -- main
+
+    def run(self):
+        self.what = describe(self.args.device)
+        where = [self.listen_unix()]
+        if self.args.tcp:
+            where.append(self.listen_tcp())
+        self.open_logs()
+        signal.signal(signal.SIGHUP, lambda *_: setattr(self, "rehup", True))
+        self.log("*", "serving %s at %d baud on %s" % (
+            self.args.device, self.args.baud, ", ".join(where)))
+        print("mpuart: %s %d baud -> %s" % (self.args.device, self.args.baud, ", ".join(where)))
+        if self.logf:
+            print("mpuart: log %s" % self.args.log)
+        print("mpuart: attach with  mpuart attach %s" % self.args.port_name)
+        print("mpuart: or just       mpuart attach")
+        sys.stdout.flush()
+
+        while True:
+            if self.fd < 0 and time.time() >= self.next_open:
+                self.open_dev()
+            for key, mask in self.sel.select(0.2):
+                d = key.data
+                if d == "unix" or d == "tcp":
+                    self.accept(key.fileobj, d)
+                elif d == "dev":
+                    if mask & selectors.EVENT_WRITE:
+                        self.pump_tx()
+                    if mask & selectors.EVENT_READ and self.fd >= 0:
+                        self.dev_read()
+                else:
+                    if mask & selectors.EVENT_WRITE:
+                        self.flush(d)
+                    if mask & selectors.EVENT_READ and not d.dead:
+                        self.client_read(d)
+            self.tag_idle()
+            self.log_idle()
+            if self.rehup:
+                self.rehup = False
+                self.open_logs()
+                self.log("*", "log reopened")
+
+
+def cmd_serve(args):
+    if not args.device:
+        ports = system_ports()
+        if not ports:
+            sys.exit("mpuart: no serial port found. Name one, "
+                     "or check the adapter is plugged in")
+        if len(ports) > 1:
+            sys.exit(port_menu(ports))
+        args.device = ports[0][0]
+        print("mpuart: %s" % ports[0][2])
+    elif "/" not in args.device and os.path.exists("/dev/" + args.device):
+        args.device = "/dev/" + args.device
+    if not args.port_name:        # a by-id path is stable but nobody calls it that
+        named = args.device
+        if named.startswith("/dev/serial/"):
+            named = os.path.realpath(named)
+        args.port_name = os.path.basename(named)
+    if args.log is None and not args.no_log:
+        args.log = os.path.join(rundir(), args.port_name + ".log")
+    if args.no_log:
+        args.log = None
+    Server(args).run()
+
+
+# --------------------------------------------------------------------------- clients
+
+
+def served():
+    """Every port with a socket in the run directory, and whether it answers."""
+    out = []
+    for n in sorted(os.listdir(RUNDIR)) if os.path.isdir(RUNDIR) else []:
+        if not n.endswith(".sock"):
+            continue
+        path = os.path.join(RUNDIR, n)
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(path)
+            live = True
+        except OSError:
+            live = False
+        finally:
+            probe.close()
+        out.append((n[:-5], path, live))
+    return out
+
+
+def pick(target, what):
+    """Name a port, or take the only one that is served."""
+    if target:
+        return target
+    up = [p for p in served() if p[2]]
+    if len(up) == 1:
+        return up[0][1]
+    if not up:
+        sys.exit("mpuart: nothing is served. Start a port with\n"
+                 "        mpuart serve /dev/ttyUSB0 115200")
+    sys.exit("mpuart: %d ports are served, name one:\n%s" % (
+        len(up), "\n".join("        mpuart %s %s" % (what, p[0]) for p in up)))
+
+
+def connect(target):
+    if re.match(r"^[^/]*:\d+$", target):
+        host, _, port = target.rpartition(":")
+        s = socket.create_connection((host or "127.0.0.1", int(port)))
+    else:
+        path = sock_path(target)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(path)
+        except OSError as e:
+            sys.exit("mpuart: cannot reach %s: %s\n"
+                     "        start it with  mpuart serve %s" % (path, e.strerror, target))
+    return s
+
+
+def say_hello(s, name, **opts):
+    parts = ["name=%s" % name] + [
+        "%s=%s" % (k, int(v) if isinstance(v, bool) else v) for k, v in opts.items()]
+    s.sendall(HELLO + " ".join(parts).encode() + b"\n")
+
+
+def keys_raw(fd):
+    """Keys through untouched, but leave OPOST alone on the way out.
+
+    A raw terminal drops the driver's LF to CRLF step, and a device that sends
+    bare LF then walks down the screen instead of starting at the left. Input
+    flags go, so Enter stays CR and Ctrl-S reaches the device.
+    """
+    import termios
+    new = termios.tcgetattr(fd)
+    new[0] &= ~(termios.IGNCR | termios.ICRNL | termios.INLCR |
+                termios.IXON | termios.ISTRIP | termios.BRKINT)
+    new[3] &= ~(termios.ICANON | termios.ECHO | termios.IEXTEN | termios.ISIG)
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, new)
+
+
+def keys_out(data, eol, raw):
+    """What a keypress becomes on the wire.
+
+    Enter is CR from the terminal. Consoles that want the LF as well ignore a
+    lone CR, so the default sends both, as miniterm does. The DEL key sends
+    0x7f, and devices expect 0x08 for backspace.
+    """
+    if raw:
+        return data
+    return re.sub(rb"\r\n|\r|\n", eol, data.replace(b"\x7f", b"\x08"))
+
+
+def cmd_attach(args):
+    import termios
+    s = connect(pick(args.target, "attach"))
+    eol = EOL[args.eol]
+    tty_in = sys.stdin.isatty() and not args.read_only
+    say_hello(s, args.name, ro=args.read_only, color=sys.stdout.isatty() and not args.no_color,
+              echo=args.echo, hist=0 if args.no_history else args.history)
+    if tty_in:
+        print("mpuart: attached as %s, Ctrl-] to quit\r" % args.name)
+    old = None
+    fd = sys.stdin.fileno()
+    if tty_in:
+        old = termios.tcgetattr(fd)
+        keys_raw(fd)
+    sel = selectors.DefaultSelector()
+    sel.register(s, selectors.EVENT_READ)
+    if not args.read_only:
+        sel.register(fd, selectors.EVENT_READ)
+    try:
+        while True:
+            for key, _ in sel.select():
+                if key.fileobj is s:
+                    data = s.recv(4096)
+                    if not data:
+                        return
+                    os.write(1, data)
+                else:
+                    data = os.read(fd, 4096)
+                    if not data:
+                        return
+                    if QUIT in data:
+                        data = data[:data.index(QUIT)]
+                        s.sendall(keys_out(data, eol, args.raw_keys))
+                        return
+                    s.sendall(keys_out(data, eol, args.raw_keys))
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        if old:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        s.close()
+        if tty_in:
+            print("\r\nmpuart: detached")
+
+
+def cmd_send(args):
+    s = connect(pick(args.target, "send"))
+    say_hello(s, args.name, color=0, hist=0, notes=0)
+    payload = args.text.encode().decode("unicode_escape").encode("latin-1")
+    if not args.no_newline:
+        payload += EOL[args.eol]
+    s.sendall(payload)
+    end = time.time() + args.wait
+    s.setblocking(False)
+    sel = selectors.DefaultSelector()
+    sel.register(s, selectors.EVENT_READ)
+    seen = bytearray()
+    while time.time() < end:
+        for _ in sel.select(max(0.0, end - time.time())):
+            data = s.recv(4096)
+            if not data:
+                return
+            seen += data
+            os.write(1, data)
+            if args.expect and re.search(args.expect.encode(), seen):
+                return
+    if args.expect:
+        sys.exit("mpuart: did not see %r in %gs" % (args.expect, args.wait))
+
+
+def ask(path):
+    """What the daemon says about itself. None if it is not one, or too old."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1.0)
+        s.connect(path)
+        s.sendall(HELLO + b"name=list query=1 hist=0 notes=0\n")
+        buf = b""
+        while b"\n" not in buf:
+            d = s.recv(4096)
+            if not d:
+                return None
+            buf += d
+        return json.loads(buf.split(b"\n")[0])
+    except (OSError, ValueError):
+        return None
+    finally:
+        s.close()
+
+
+def cmd_list(args):
+    ports = served()
+    if not ports:
+        print("nothing served (%s)" % RUNDIR)
+        return
+    for i, (name, path, live) in enumerate(ports):
+        if i:
+            print()
+        if not live:
+            print("%-10s stale socket, no daemon" % name)
+            continue
+        st = ask(path)
+        if not st:
+            print("%-10s up, but it did not say what it is" % name)
+            continue
+        here = st.get("clients") or []
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        print("%-10s %s" % (name, st.get("what") or "unknown hardware"))
+        print("%-10s %d baud, %s%s%s" % (
+            "", st["baud"], "connected" if st["open"] else "waiting for device",
+            "" if mode == 0o666 else ", mode %04o" % mode,
+            (", here: " + ", ".join(here)) if here else ""))
+        print("%-10s %s" % ("", st["device"]))
+        if st.get("log"):
+            print("%-10s %s" % ("", st["log"]))
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def main():
+    p = argparse.ArgumentParser(prog="mpuart", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    who = os.environ.get("MPUART_NAME") or getpass.getuser()
+
+    a = sub.add_parser("serve", help="own the port and serve it to everyone else")
+    a.add_argument("device", nargs="?",
+                   help="left out, the only serial port on the machine, "
+                        "by its stable /dev/serial/by-id name")
+    a.add_argument("baud", nargs="?", type=int, default=115200)
+    a.add_argument("--as", dest="port_name", metavar="NAME",
+                   help="what to call it in the socket, the log and mpuart list")
+    a.add_argument("--tcp", metavar="[HOST:]PORT", help="also listen on tcp")
+    a.add_argument("--log", metavar="FILE", help="default /tmp/mpuart/<dev>.log")
+    a.add_argument("--no-log", action="store_true")
+    a.add_argument("--raw-log", metavar="FILE", help="exact device bytes, no timestamps")
+    a.add_argument("--history", type=parse_history, default=parse_history("2000"),
+                   metavar="N", help="replay N lines, or bytes with k or M "
+                                     "(default 2000 lines)")
+    a.add_argument("--mode", type=lambda s: int(s, 8), default=0o666,
+                   help="socket and log permissions, octal (default 666)")
+    a.add_argument("--rtscts", action="store_true")
+    a.add_argument("--xonxoff", action="store_true")
+    a.add_argument("--no-exclusive", action="store_true",
+                   help="do not claim the port with TIOCEXCL")
+    a.add_argument("-v", "--verbose", action="store_true")
+    a.set_defaults(fn=cmd_serve)
+
+    a = sub.add_parser("attach", help="interactive terminal, Ctrl-] to quit")
+    a.add_argument("target", nargs="?",
+                   help="device name, socket path or [host:]port; "
+                        "left out, the only served port")
+    a.add_argument("-n", "--name", default=who)
+    a.add_argument("-r", "--read-only", action="store_true")
+    a.add_argument("--echo", action="store_true", help="also tag your own typing back")
+    a.add_argument("--eol", choices=list(EOL), default="crlf",
+                   help="what Enter sends (default crlf, as miniterm)")
+    a.add_argument("--raw-keys", action="store_true",
+                   help="send keys untouched, no eol and no DEL to backspace")
+    a.add_argument("--history", metavar="N", default="all", type=want_lines,
+                   help="replay at most N lines, less than the daemon holds")
+    a.add_argument("--no-history", action="store_true")
+    a.add_argument("--no-color", action="store_true")
+    a.set_defaults(fn=cmd_attach)
+
+    a = sub.add_parser("send", help="write one line, print what comes back")
+    a.add_argument("target", nargs="?")
+    a.add_argument("text")
+    a.add_argument("-n", "--name", default=who + "/send")
+    a.add_argument("-w", "--wait", type=float, default=1.0, help="seconds to read")
+    a.add_argument("-e", "--expect", metavar="REGEX", help="stop early, fail if unseen")
+    a.add_argument("--eol", choices=list(EOL), default="crlf")
+    a.add_argument("-N", "--no-newline", action="store_true")
+    a.set_defaults(fn=cmd_send)
+
+    a = sub.add_parser("list", help="show served ports")
+    a.set_defaults(fn=cmd_list)
+
+    args = p.parse_args()
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
